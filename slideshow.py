@@ -20,6 +20,8 @@ From this folder:
 
     python slideshow.py
 
+Or double-click release/MediaSlideshow.exe after building with build_exe.py.
+
 Usage
 -----
 1. Click "Select Media Folder" and choose a folder containing images and/or videos.
@@ -27,6 +29,16 @@ Usage
 3. Set "Image Duration" (seconds) for how long each image is shown.
 4. Click "Start Slideshow" for borderless fullscreen playback.
 5. Press Esc at any time to stop and return to the setup window.
+
+Slideshow controls
+------------------
+- Space       Play / Pause
+- Left/Right  Previous / Next media
+- R           Toggle repeat (loop video or hold image)
+- Up/Down     Increase / Decrease volume
+- M           Toggle mute
+- I           Toggle filename and position overlay
+- Esc         Exit slideshow
 """
 
 from __future__ import annotations
@@ -35,8 +47,8 @@ import random
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtGui import QKeyEvent, QPixmap
+from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent
+from PyQt6.QtGui import QKeyEvent, QMouseEvent, QPixmap
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
@@ -56,6 +68,16 @@ from PyQt6.QtWidgets import (
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".m4v", ".mpeg", ".mpg"}
+
+OVERLAY_STYLE = """
+    QLabel {
+        background-color: rgba(0, 0, 0, 160);
+        color: white;
+        padding: 8px 14px;
+        font-size: 15px;
+        border-radius: 6px;
+    }
+"""
 
 
 def scan_media_folder(folder: Path) -> list[Path]:
@@ -80,6 +102,10 @@ def is_video(path: Path) -> bool:
 class SlideshowWindow(QWidget):
     """Borderless fullscreen slideshow with image and video support."""
 
+    CURSOR_HIDE_MS = 2000
+    OSD_HIDE_MS = 2000
+    VOLUME_STEP = 0.05
+
     def __init__(
         self,
         media_files: list[Path],
@@ -89,18 +115,27 @@ class SlideshowWindow(QWidget):
     ) -> None:
         super().__init__(parent)
         self._all_media = media_files
-        self._image_duration_ms = max(1, int(image_duration_sec * 1000))
+        self._base_image_duration_ms = max(1, int(image_duration_sec * 1000))
+        self._paused_remaining_ms = 0
         self._randomize = randomize
 
         self._playlist: list[Path] = []
         self._index = 0
         self._current_pixmap: QPixmap | None = None
 
+        self._paused = False
+        self._repeat_mode = False
+        self._muted = False
+        self._volume = 1.0
+        self._show_info = False
+        self._cursor_hidden = False
+
         self.setWindowFlags(
             Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         )
         self.setStyleSheet("background-color: black;")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -118,22 +153,46 @@ class SlideshowWindow(QWidget):
         self._video_widget.setStyleSheet("background-color: black;")
         self._stack.addWidget(self._video_widget)
 
+        for widget in (self._stack, self._image_label, self._video_widget):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
         self._player.setAudioOutput(self._audio_output)
         self._player.setVideoOutput(self._video_widget)
         self._player.mediaStatusChanged.connect(self._on_media_status)
         self._player.errorOccurred.connect(self._on_player_error)
+        self._audio_output.setVolume(self._volume)
 
         self._image_timer = QTimer(self)
         self._image_timer.setSingleShot(True)
         self._image_timer.timeout.connect(self._advance)
+
+        self._info_label = QLabel(self)
+        self._info_label.setStyleSheet(OVERLAY_STYLE)
+        self._info_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._info_label.hide()
+
+        self._osd_label = QLabel(self)
+        self._osd_label.setStyleSheet(OVERLAY_STYLE)
+        self._osd_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._osd_label.hide()
+
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.timeout.connect(self._hide_cursor)
+
+        self._osd_timer = QTimer(self)
+        self._osd_timer.setSingleShot(True)
+        self._osd_timer.timeout.connect(self._osd_label.hide)
 
         self._reset_playlist()
         self.showFullScreen()
         self.activateWindow()
         self.raise_()
         self.setFocus()
+        self._start_cursor_hide_timer()
         QTimer.singleShot(0, self._show_current)
 
     def _reset_playlist(self) -> None:
@@ -141,6 +200,19 @@ class SlideshowWindow(QWidget):
         if self._randomize:
             random.shuffle(self._playlist)
         self._index = 0
+
+    def _current_path(self) -> Path | None:
+        if not self._playlist or self._index >= len(self._playlist):
+            return None
+        return self._playlist[self._index]
+
+    def _is_showing_video(self) -> bool:
+        path = self._current_path()
+        return path is not None and is_video(path)
+
+    def _is_showing_image(self) -> bool:
+        path = self._current_path()
+        return path is not None and not is_video(path)
 
     def _show_current(self) -> None:
         if not self._playlist:
@@ -151,6 +223,7 @@ class SlideshowWindow(QWidget):
             self._reset_playlist()
 
         path = self._playlist[self._index]
+        self._paused_remaining_ms = 0
         self._image_timer.stop()
         self._player.stop()
 
@@ -160,6 +233,8 @@ class SlideshowWindow(QWidget):
             self._current_pixmap = None
             self._player.setSource(QUrl.fromLocalFile(str(path.resolve())))
             self._player.play()
+            if self._paused:
+                self._player.pause()
         else:
             self._stack.setCurrentWidget(self._image_label)
             pixmap = QPixmap(str(path))
@@ -168,7 +243,19 @@ class SlideshowWindow(QWidget):
                 return
             self._current_pixmap = pixmap
             self._update_image_display()
-            self._image_timer.start(self._image_duration_ms)
+            self._start_image_timer_if_needed()
+
+        self._update_info_overlay()
+        self._position_overlays()
+        self._info_label.raise_()
+        self._osd_label.raise_()
+
+    def _start_image_timer_if_needed(self) -> None:
+        if self._repeat_mode or self._paused:
+            return
+        duration = self._paused_remaining_ms or self._base_image_duration_ms
+        self._image_timer.start(max(1, duration))
+        self._paused_remaining_ms = 0
 
     def _update_image_display(self) -> None:
         if self._current_pixmap is None or self._current_pixmap.isNull():
@@ -181,31 +268,187 @@ class SlideshowWindow(QWidget):
         self._image_label.setPixmap(scaled)
 
     def _advance(self) -> None:
+        if self._paused:
+            return
         self._index += 1
         self._show_current()
 
+    def _go_next(self) -> None:
+        if not self._playlist:
+            return
+        self._paused = False
+        self._paused_remaining_ms = 0
+        self._index = (self._index + 1) % len(self._playlist)
+        self._show_current()
+
+    def _go_previous(self) -> None:
+        if not self._playlist:
+            return
+        self._paused = False
+        self._paused_remaining_ms = 0
+        self._index = (self._index - 1) % len(self._playlist)
+        self._show_current()
+
     def _on_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+        if status != QMediaPlayer.MediaStatus.EndOfMedia:
+            return
+        if self._repeat_mode and self._is_showing_video():
+            self._player.setPosition(0)
+            if not self._paused:
+                self._player.play()
+            return
+        if not self._paused:
             self._advance()
 
     def _on_player_error(self, _error: QMediaPlayer.Error, _message: str) -> None:
-        self._advance()
+        if not self._paused:
+            self._advance()
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        if self._is_showing_video():
+            if self._paused:
+                self._player.pause()
+            else:
+                self._player.play()
+        elif self._is_showing_image():
+            if self._paused:
+                remaining = self._image_timer.remainingTime()
+                self._image_timer.stop()
+                if remaining > 0:
+                    self._paused_remaining_ms = remaining
+            elif not self._repeat_mode:
+                self._start_image_timer_if_needed()
+        self._show_osd("Paused" if self._paused else "Playing")
+
+    def _toggle_repeat(self) -> None:
+        self._repeat_mode = not self._repeat_mode
+        if self._is_showing_image():
+            if self._repeat_mode:
+                remaining = self._image_timer.remainingTime()
+                self._image_timer.stop()
+                if remaining > 0:
+                    self._paused_remaining_ms = remaining
+            elif not self._paused:
+                self._start_image_timer_if_needed()
+        self._show_osd(f"Repeat: {'ON' if self._repeat_mode else 'OFF'}")
+
+    def _toggle_mute(self) -> None:
+        self._muted = not self._muted
+        self._audio_output.setMuted(self._muted)
+        self._show_osd("Muted" if self._muted else "Unmuted")
+
+    def _adjust_volume(self, delta: float) -> None:
+        self._volume = max(0.0, min(1.0, self._volume + delta))
+        self._audio_output.setVolume(self._volume)
+        if self._volume > 0.0 and self._muted:
+            self._muted = False
+            self._audio_output.setMuted(False)
+        percent = int(round(self._volume * 100))
+        self._show_osd(f"Volume: {percent}%")
+
+    def _toggle_info(self) -> None:
+        self._show_info = not self._show_info
+        self._update_info_overlay()
+
+    def _update_info_overlay(self) -> None:
+        if not self._show_info or not self._playlist:
+            self._info_label.hide()
+            return
+        path = self._current_path()
+        filename = path.name if path else "Unknown"
+        position = f"{self._index + 1} / {len(self._playlist)}"
+        self._info_label.setText(f"{filename}\n{position}")
+        self._info_label.adjustSize()
+        self._info_label.show()
+        self._position_overlays()
+
+    def _show_osd(self, message: str) -> None:
+        self._osd_label.setText(message)
+        self._osd_label.adjustSize()
+        self._osd_label.show()
+        self._position_overlays()
+        self._osd_timer.start(self.OSD_HIDE_MS)
+
+    def _position_overlays(self) -> None:
+        margin = 20
+        if self._info_label.isVisible():
+            self._info_label.move(margin, margin)
+        if self._osd_label.isVisible():
+            x = self.width() - self._osd_label.width() - margin
+            y = self.height() - self._osd_label.height() - margin
+            self._osd_label.move(max(margin, x), max(margin, y))
+
+    def _start_cursor_hide_timer(self) -> None:
+        self._cursor_timer.start(self.CURSOR_HIDE_MS)
+
+    def _reveal_cursor(self) -> None:
+        if self._cursor_hidden:
+            self.unsetCursor()
+            self._cursor_hidden = False
+        self._start_cursor_hide_timer()
+
+    def _hide_cursor(self) -> None:
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        self._cursor_hidden = True
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._stack.currentWidget() is self._image_label:
             self._update_image_display()
+        self._position_overlays()
+        self._info_label.raise_()
+        self._osd_label.raise_()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        self._reveal_cursor()
+        super().mouseMoveEvent(event)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseMove:
+            self._reveal_cursor()
+        return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() == Qt.Key.Key_Escape:
+        key = event.key()
+
+        if key == Qt.Key.Key_Escape:
             self.stop_and_close()
             return
+        if key == Qt.Key.Key_Space:
+            self._toggle_pause()
+            return
+        if key == Qt.Key.Key_Right:
+            self._go_next()
+            return
+        if key == Qt.Key.Key_Left:
+            self._go_previous()
+            return
+        if key in (Qt.Key.Key_R,):
+            self._toggle_repeat()
+            return
+        if key == Qt.Key.Key_Up:
+            self._adjust_volume(self.VOLUME_STEP)
+            return
+        if key == Qt.Key.Key_Down:
+            self._adjust_volume(-self.VOLUME_STEP)
+            return
+        if key == Qt.Key.Key_M:
+            self._toggle_mute()
+            return
+        if key == Qt.Key.Key_I:
+            self._toggle_info()
+            return
+
         super().keyPressEvent(event)
 
     def stop_and_close(self) -> None:
         self._image_timer.stop()
+        self._cursor_timer.stop()
+        self._osd_timer.stop()
         self._player.stop()
         self._player.setSource(QUrl())
+        self.unsetCursor()
         self.hide()
         self.deleteLater()
 
@@ -216,7 +459,7 @@ class SetupWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Media Slideshow")
-        self.setMinimumSize(420, 260)
+        self.setMinimumSize(420, 300)
 
         self._media_folder: Path | None = None
         self._slideshow: SlideshowWindow | None = None
@@ -255,7 +498,11 @@ class SetupWindow(QMainWindow):
         self._start_btn.clicked.connect(self._start_slideshow)
         layout.addWidget(self._start_btn)
 
-        hint = QLabel("Press Esc during the slideshow to return here.")
+        hint = QLabel(
+            "Esc: exit slideshow\n"
+            "Space: pause/play | ←/→: prev/next | R: repeat\n"
+            "↑/↓: volume | M: mute | I: info overlay"
+        )
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hint)
 
