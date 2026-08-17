@@ -1,0 +1,5 @@
+# Runtime dependency (only needed if running slideshow.py directly)
+PyQt6>=6.5.0
+
+# Build dependency (only needed to create MediaSlideshow.exe)
+pyinstaller>=6.0.0
